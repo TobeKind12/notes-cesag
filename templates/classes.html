@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Mes classes — Notes de classe{% endblock %}
+{% block content %}
+<h2 class="h4 mb-3">Étape 1 — Créer / gérer sa classe</h2>
+
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header">Classes</div>
+      <div class="list-group list-group-flush">
+        {% for c in classes %}
+          <a href="{{ url_for('classes_page', **{'class': c.id}) }}"
+             class="list-group-item list-group-item-action {{ 'active' if c.id == selected_class else '' }}">
+            {{ c.name }} <small class="text-muted">{{ c.id[:8] }}</small>
+          </a>
+        {% else %}
+          <div class="list-group-item text-muted">Aucune classe pour le moment.</div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header">Créer une nouvelle classe</div>
+      <div class="card-body">
+        <form method="post" action="{{ url_for('class_create') }}" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="mb-3">
+            <label class="form-label">Nom de la classe</label>
+            <input type="text" name="name" class="form-control" placeholder="MSMD1" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Liste (Excel/CSV : Nom, Prénom, Email)</label>
+            <input type="file" name="file" class="form-control" accept=".xlsx,.xls,.csv" required>
+          </div>
+          <button class="btn btn-primary w-100" type="submit">Créer la classe</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    {% if not classes %}
+      <div class="alert alert-info">Créez d'abord une classe avec le formulaire à gauche.</div>
+    {% else %}
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h3 class="h5 mb-0">{{ students|length }} étudiant(s)</h3>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-sm table-striped align-middle">
+          <thead><tr><th>Nom</th><th>Prénom</th><th>E-mail</th><th style="width:180px">Actions</th></tr></thead>
+          <tbody>
+            {% for s in students %}
+            <tr>
+              <td>{{ s.nom }}</td><td>{{ s.prenom }}</td><td>{{ s.email }}</td>
+              <td>
+                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('classes_page', **{'class': selected_class, 'edit': s.id}) }}">Modifier</a>
+                <form method="post" action="{{ url_for('student_delete', student_id=s.id) }}" class="d-inline" onsubmit="return confirm('Supprimer cet étudiant ?');">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="class_id" value="{{ selected_class }}">
+                  <button class="btn btn-sm btn-outline-danger" type="submit">Supprimer</button>
+                </form>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-muted">Aucun étudiant.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {% if editing %}
+      <div class="card mb-3 border-primary">
+        <div class="card-header">Modifier {{ editing.nom }} {{ editing.prenom }}</div>
+        <div class="card-body">
+          <form method="post" action="{{ url_for('student_update', student_id=editing.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="class_id" value="{{ selected_class }}">
+            <div class="row g-2">
+              <div class="col"><input name="nom" class="form-control" value="{{ editing.nom }}" required></div>
+              <div class="col"><input name="prenom" class="form-control" value="{{ editing.prenom }}" required></div>
+              <div class="col"><input name="email" type="email" class="form-control" value="{{ editing.email }}" required></div>
+              <div class="col-auto"><button class="btn btn-primary" type="submit">Enregistrer</button></div>
+              <div class="col-auto"><a class="btn btn-outline-secondary" href="{{ url_for('classes_page', **{'class': selected_class}) }}">Annuler</a></div>
+            </div>
+          </form>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="row g-3">
+        <div class="col-md-6">
+          <div class="card h-100">
+            <div class="card-header">Ajouter un étudiant</div>
+            <div class="card-body">
+              <form method="post" action="{{ url_for('student_add', class_id=selected_class) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input name="nom" class="form-control mb-2" placeholder="Nom" required>
+                <input name="prenom" class="form-control mb-2" placeholder="Prénom" required>
+                <input name="email" type="email" class="form-control mb-2" placeholder="Email" required>
+                <button class="btn btn-success btn-sm" type="submit">Ajouter</button>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card h-100">
+            <div class="card-header">Remplacer toute la liste</div>
+            <div class="card-body">
+              <form method="post" action="{{ url_for('students_reload', class_id=selected_class) }}" enctype="multipart/form-data" onsubmit="return confirm('Remplacer la liste actuelle ?');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="file" name="file" class="form-control mb-2" accept=".xlsx,.xls,.csv" required>
+                <button class="btn btn-warning btn-sm" type="submit">Remplacer la liste</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card border-danger mt-3">
+        <div class="card-header text-danger">Supprimer la classe et toutes ses données</div>
+        <div class="card-body">
+          <form method="post" action="{{ url_for('class_delete', class_id=selected_class) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="input-group">
+              <input name="confirmation" class="form-control" placeholder="Tapez le nom de la classe pour confirmer" required>
+              <button class="btn btn-danger" type="submit">Supprimer définitivement</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

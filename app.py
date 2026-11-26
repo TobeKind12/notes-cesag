@@ -1,34 +1,91 @@
-"""Application Streamlit + Supabase : envoi de notes aux étudiants.
+"""Notes de classe — application Flask serverless pour Vercel.
 
-Comptes Supabase Auth, données isolées par RLS, envoi via Resend ou Brevo.
-Les secrets (clés API, URL Supabase) sont lus depuis st.secrets.
+Authentification et données : Supabase (REST + RLS).
+Envoi d'e-mails : Resend (batch) ou Brevo.
+Aucun état serveur persistant : les aperçus sont transmis par formulaire.
 """
 
 from __future__ import annotations
 
+import hmac
 import io
+import json
+import os
 import re
+import secrets as pysecrets
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import pandas as pd
 import requests
-import streamlit as st
-from supabase import Client, create_client
+from flask import (
+    Flask,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from dotenv import load_dotenv
 
-DAILY_LIMIT = 200  # limite d'envois par jour et par compte
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or pysecrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+
+DAILY_LIMIT = 200
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SITE_URL = os.getenv("SITE_URL", "").rstrip("/")
+
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
+SENDER_NAME = os.getenv("SENDER_NAME", "Notes de classe")
+REPLY_TO = os.getenv("REPLY_TO", SENDER_EMAIL)
 
 
 # =========================
-# Utilitaires généraux
+# Sécurité / contexte
 # =========================
 
-def secret(key: str, default=""):
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
+@app.before_request
+def csrf_protect():
+    if "csrf_token" not in session:
+        session["csrf_token"] = pysecrets.token_hex(16)
+    if request.method == "POST":
+        token = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token", "")
+        if not token or not hmac.compare_digest(token, session["csrf_token"]):
+            abort(400, "Jeton CSRF invalide.")
 
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+@app.context_processor
+def inject_globals():
+    return {
+        "csrf_token": session.get("csrf_token", ""),
+        "current_user": current_user(),
+        "DAILY_LIMIT": DAILY_LIMIT,
+        "SENDER_NAME": SENDER_NAME,
+    }
+
+
+# =========================
+# Utilitaires
+# =========================
 
 def clean(value) -> str:
     text = unicodedata.normalize("NFD", str(value or ""))
@@ -66,9 +123,8 @@ def colonnes(df: pd.DataFrame) -> dict[str, str]:
     return {clean(c): c for c in df.columns}
 
 
-def lire_fichier(upload) -> pd.DataFrame:
-    data = upload.getvalue()
-    name = upload.name.lower()
+def lire_fichier(data: bytes, name: str) -> pd.DataFrame:
+    name = name.lower()
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(data))
     try:
@@ -77,141 +133,168 @@ def lire_fichier(upload) -> pd.DataFrame:
     except UnicodeDecodeError:
         text = data.decode("latin-1")
         enc = "latin-1"
-    sep = ";" if (text.splitlines()[0].count(";") > text.splitlines()[0].count(",") if text.splitlines() else False) else ","
+    first = text.splitlines()[0] if text.splitlines() else ""
+    sep = ";" if first.count(";") > first.count(",") else ","
     return pd.read_csv(io.BytesIO(data), encoding=enc, sep=sep, dtype=str)
 
 
+def public_url() -> str:
+    if SITE_URL:
+        return SITE_URL
+    return request.host_url.rstrip("/")
+
+
 # =========================
-# Supabase
+# Supabase REST
 # =========================
 
-def get_supabase() -> Client:
-    """Client Supabase par session Streamlit (pas de cache global pour l'auth)."""
-    if "sb_client" in st.session_state:
-        return st.session_state["sb_client"]
-    url = secret("SUPABASE_URL")
-    key = secret("SUPABASE_KEY")
-    if not url or not key:
-        st.error("Secrets manquants : SUPABASE_URL et SUPABASE_KEY.")
-        st.stop()
-    sb = create_client(url, key)
-    st.session_state["sb_client"] = sb
-    return sb
+def sb_base() -> str:
+    base = SUPABASE_URL.rstrip("/")
+    if base.endswith("/rest/v1"):
+        base = base[: -len("/rest/v1")]
+    return base
 
 
-def ensure_auth() -> Client:
-    """Applique la session Supabase stockée pour que les requêtes RLS passent."""
-    sb = get_supabase()
-    sess = st.session_state.get("session")
-    if sess:
-        try:
-            sb.auth.set_session(sess.access_token, sess.refresh_token)
-        except Exception:
-            pass
-    return sb
+def sb_headers(token: str | None = None, prefer: str | None = None) -> dict[str, str]:
+    headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
 
 
-def current_user():
-    return st.session_state.get("user")
-
-
-def require_auth():
-    user = current_user()
-    if not user:
-        page_auth()
-        st.stop()
-    return user
-
-
-def db_call(fn, error_msg="Erreur de base de données"):
+def sb_request(method: str, path: str, *, token: str | None = None,
+               json_body=None, params=None, prefer: str | None = None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Secrets Supabase manquants (SUPABASE_URL, SUPABASE_KEY).")
+    url = f"{sb_base()}{path}"
+    response = requests.request(
+        method, url, headers=sb_headers(token, prefer),
+        json=json_body, params=params, timeout=20,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase {response.status_code} : {response.text[:300]}")
+    if response.status_code == 204 or not response.content:
+        return None
     try:
-        return fn()
-    except Exception as exc:
-        st.error(f"{error_msg} : {exc}")
+        return response.json()
+    except ValueError:
         return None
 
 
-# =========================
-# Authentification
-# =========================
-
-def page_auth():
-    st.title("Notes de classe")
-    st.caption("Envoi sécurisé des notes aux étudiants.")
-    tab_login, tab_signup, tab_reset = st.tabs(["Connexion", "Créer un compte", "Mot de passe oublié"])
-
-    with tab_login:
-        email = st.text_input("Adresse e-mail", key="login_email")
-        pwd = st.text_input("Mot de passe", type="password", key="login_pwd")
-        if st.button("Se connecter", type="primary"):
-            try:
-                res = ensure_auth().auth.sign_in_with_password({"email": email.strip(), "password": pwd})
-                st.session_state["user"] = res.user
-                st.session_state["session"] = res.session
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Connexion impossible : {exc}")
-
-    with tab_signup:
-        name = st.text_input("Votre nom (affiché aux étudiants)", key="su_name")
-        email = st.text_input("Adresse e-mail", key="su_email")
-        pwd = st.text_input("Mot de passe (8 caractères min.)", type="password", key="su_pwd")
-        if st.button("Créer le compte"):
-            if not name.strip() or not email.strip() or len(pwd) < 8:
-                st.error("Nom, e-mail valide et mot de passe de 8 caractères minimum requis.")
-            else:
-                try:
-                    ensure_auth().auth.sign_up({
-                        "email": email.strip(),
-                        "password": pwd,
-                        "options": {"data": {"full_name": name.strip()}},
-                    })
-                    st.success("Compte créé. Vérifiez votre boîte mail pour confirmer votre adresse, puis connectez-vous.")
-                except Exception as exc:
-                    st.error(f"Inscription impossible : {exc}")
-
-    with tab_reset:
-        email = st.text_input("Adresse e-mail du compte", key="reset_email")
-        if st.button("Envoyer le lien de réinitialisation"):
-            if not email.strip():
-                st.error("Indiquez votre adresse e-mail.")
-            else:
-                try:
-                    redirect = secret("SITE_URL", "http://localhost:8501")
-                    ensure_auth().auth.reset_password_for_email(email.strip(), {"redirect_to": redirect})
-                    st.success("Si un compte existe, un e-mail de réinitialisation a été envoyé.")
-                except Exception as exc:
-                    st.error(f"Demande impossible : {exc}")
-
-
-def logout():
+def sb_call(method: str, path: str, **kwargs):
+    """Appel Supabase avec rafraîchissement automatique du token."""
+    token = session.get("access_token")
     try:
-        ensure_auth().auth.sign_out()
-    except Exception:
-        pass
-    for k in ["user", "session", "preview_df", "preview_key", "sb_client"]:
-        st.session_state.pop(k, None)
-    st.rerun()
+        return sb_request(method, path, token=token, **kwargs)
+    except RuntimeError as exc:
+        if "401" not in str(exc) or not session.get("refresh_token"):
+            raise
+        data = sb_request(
+            "POST", "/auth/v1/token?grant_type=refresh_token",
+            json_body={"refresh_token": session["refresh_token"]},
+        )
+        session["access_token"] = data["access_token"]
+        session["refresh_token"] = data.get("refresh_token", session["refresh_token"])
+        session["user"] = data.get("user", session.get("user"))
+        session.modified = True
+        return sb_request(method, path, token=session["access_token"], **kwargs)
+
+
+def eq(value) -> str:
+    return quote(str(value), safe="")
+
+
+def api_get(table: str, filters: dict[str, str], select: str = "*", order: str | None = None,
+            limit: int | None = None):
+    params = {"select": select}
+    for key, value in filters.items():
+        params[key] = f"eq.{value}"
+    if order:
+        params["order"] = order
+    if limit:
+        params["limit"] = str(limit)
+    return sb_call("GET", f"/rest/v1/{table}", params=params) or []
+
+
+def api_insert(table: str, payload):
+    return sb_call("POST", f"/rest/v1/{table}", json_body=payload,
+                   prefer="return=representation")
+
+
+def api_update(table: str, filters: dict[str, str], payload: dict):
+    params = {key: f"eq.{value}" for key, value in filters.items()}
+    return sb_call("PATCH", f"/rest/v1/{table}", params=params, json_body=payload,
+                   prefer="return=representation")
+
+
+def api_delete(table: str, filters: dict[str, str]):
+    params = {key: f"eq.{value}" for key, value in filters.items()}
+    return sb_call("DELETE", f"/rest/v1/{table}", params=params,
+                   prefer="return=representation")
+
+
+def auth_signup(email: str, password: str, full_name: str):
+    return sb_request(
+        "POST", "/auth/v1/signup",
+        json_body={"email": email, "password": password,
+                   "options": {"data": {"full_name": full_name}}},
+    )
+
+
+def auth_signin(email: str, password: str):
+    return sb_request(
+        "POST", "/auth/v1/token?grant_type=password",
+        json_body={"email": email, "password": password},
+    )
+
+
+def auth_recover(email: str, redirect_to: str):
+    return sb_request("POST", "/auth/v1/recover",
+                      json_body={"email": email, "redirect_to": redirect_to})
 
 
 # =========================
-# Données classes / étudiants
+# Session utilisateur
+# =========================
+
+def current_user():
+    return session.get("user")
+
+
+def login_required(view):
+    from functools import wraps
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            flash("Connecte-toi pour accéder à cette page.", "error")
+            return redirect(url_for("home"))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def clear_session():
+    session.pop("access_token", None)
+    session.pop("refresh_token", None)
+    session.pop("user", None)
+
+
+# =========================
+# Classes / étudiants
 # =========================
 
 def fetch_classes(user_id: str):
-    res = ensure_auth().table("classes").select("*").eq("user_id", user_id).order("created_at").execute()
-    return res.data or []
+    return api_get("classes", {"user_id": user_id}, order="created_at")
 
 
-def fetch_students(class_id: str):
-    res = ensure_auth().table("students").select("*").eq("class_id", class_id).order("nom").execute()
-    return res.data or []
-
-
-def insert_students(user_id: str, class_id: str, rows: list[dict]):
-    payload = [{"user_id": user_id, "class_id": class_id, **r} for r in rows]
-    if payload:
-        ensure_auth().table("students").insert(payload).execute()
+def fetch_students(class_id: str, user_id: str | None = None):
+    filters = {"class_id": class_id}
+    if user_id:
+        filters["user_id"] = user_id
+    return api_get("students", filters, order="nom")
 
 
 def validate_class_file(df: pd.DataFrame):
@@ -221,33 +304,40 @@ def validate_class_file(df: pd.DataFrame):
         return [], [f"Colonnes manquantes : {', '.join(sorted(missing))}"]
     errors, rows, seen = [], [], set()
     for i, row in df.iterrows():
-        nom, prenom, email = txt(row[cols["nom"]]), txt(row[cols["prenom"]]), txt(row[cols["email"]]).lower()
+        nom = txt(row[cols["nom"]])
+        prenom = txt(row[cols["prenom"]])
+        email = txt(row[cols["email"]]).lower()
         if not nom or not prenom or not email:
-            errors.append(f"Ligne {i+2} : nom, prénom et e-mail requis.")
+            errors.append(f"Ligne {i + 2} : nom, prénom et e-mail requis.")
             continue
         if not email_valide(email):
-            errors.append(f"Ligne {i+2} ({nom} {prenom}) : e-mail invalide « {email} ».")
+            errors.append(f"Ligne {i + 2} ({nom} {prenom}) : e-mail invalide « {email} ».")
             continue
-        key = email
-        if key in seen:
-            errors.append(f"Ligne {i+2} : doublon d'e-mail « {email} ».")
+        if email in seen:
+            errors.append(f"Ligne {i + 2} : doublon d'e-mail « {email} ».")
             continue
-        seen.add(key)
+        seen.add(email)
         rows.append({"nom": nom, "prenom": prenom, "email": email})
     return rows, errors
 
 
-# =========================
-# Matching des notes
-# =========================
+def insert_students(user_id: str, class_id: str, rows: list[dict]):
+    payload = [{"user_id": user_id, "class_id": class_id, **row} for row in rows]
+    if payload:
+        api_insert("students", payload)
+
 
 def build_index(students: list[dict]):
-    index = {}
-    for s in students:
-        for key in [(clean(s["nom"]), clean(s["prenom"])), (clean(s["prenom"]), clean(s["nom"]))]:
-            index.setdefault(key, [])
-            if s["id"] not in {x["id"] for x in index[key]}:
-                index[key].append(s)
+    index: dict[tuple[str, str], list[dict]] = {}
+    for student in students:
+        keys = [
+            (clean(student["nom"]), clean(student["prenom"])),
+            (clean(student["prenom"]), clean(student["nom"])),
+        ]
+        for key in keys:
+            bucket = index.setdefault(key, [])
+            if student["id"] not in {item["id"] for item in bucket}:
+                bucket.append(student)
     return index
 
 
@@ -259,7 +349,8 @@ def preparer_apercu(notes_df: pd.DataFrame, students: list[dict]):
     index = build_index(students)
     rows = []
     for i, row in notes_df.iterrows():
-        nom, prenom = txt(row[cols["nom"]]), txt(row[cols["prenom"]])
+        nom = txt(row[cols["nom"]])
+        prenom = txt(row[cols["prenom"]])
         note, note_ok = parse_note(row[cols["note"]])
         matches = index.get((clean(nom), clean(prenom)), [])
         if not note_ok:
@@ -274,7 +365,8 @@ def preparer_apercu(notes_df: pd.DataFrame, students: list[dict]):
         else:
             status = "Introuvable dans la classe"
             match_id = ""
-        chosen = next((m for m in matches if m["id"] == match_id), matches[0] if len(matches) == 1 else None)
+        chosen = next((m for m in matches if m["id"] == match_id),
+                      matches[0] if len(matches) == 1 else None)
         rows.append({
             "row_id": i,
             "Nom": nom,
@@ -284,101 +376,7 @@ def preparer_apercu(notes_df: pd.DataFrame, students: list[dict]):
             "Vérification": status,
             "student_id": match_id,
         })
-    return pd.DataFrame(rows)
-
-
-def appliquer_corrections(preview: pd.DataFrame, students: list[dict]) -> pd.DataFrame:
-    by_id = {s["id"]: s for s in students}
-    options = {"": "— choisir un étudiant —"}
-    options.update({s["id"]: f"{s['nom']} {s['prenom']} <{s['email']}>" for s in students})
-    corrected = preview.copy()
-    for idx, row in corrected.iterrows():
-        if row["Vérification"] == "OK":
-            continue
-        key = f"fix_{st.session_state.get('preview_key','')}_{row['row_id']}"
-        choice = st.selectbox(
-            f"Correction pour {row['Nom']} {row['Prénom']} ({row['Note']}) — {row['Vérification']}",
-            options=list(options.keys()),
-            format_func=lambda x: options[x],
-            key=key,
-        )
-        if choice and choice in by_id:
-            s = by_id[choice]
-            corrected.at[idx, "student_id"] = s["id"]
-            corrected.at[idx, "E-mail trouvé"] = s["email"]
-            corrected.at[idx, "Prénom"] = s["prenom"]
-            note, note_ok = parse_note(row["Note"])
-            corrected.at[idx, "Vérification"] = "OK" if note_ok else "Note invalide (vide ou hors 0-20)"
-    return corrected
-
-
-# =========================
-# Envoi e-mail
-# =========================
-
-def build_message(prenom, matiere, eval_type, note, sender_name):
-    return (
-        f"Bonjour {prenom}, ta note de {matiere} ({eval_type}) est : {note}/20. "
-        f"Envoyé par {sender_name}."
-    )
-
-
-def send_email(to_email: str, subject: str, body: str):
-    sender_email = secret("SENDER_EMAIL")
-    sender_name = secret("SENDER_NAME", "Notes de classe")
-    reply_to = secret("REPLY_TO", sender_email)
-    resend_key = secret("RESEND_API_KEY")
-    brevo_key = secret("BREVO_API_KEY")
-
-    if resend_key:
-        r = requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
-            json={
-                "from": f"{sender_name} <{sender_email}>",
-                "to": [to_email],
-                "subject": subject,
-                "text": body,
-                "reply_to": reply_to,
-            },
-            timeout=30,
-        )
-        if r.status_code >= 300:
-            raise RuntimeError(f"Resend {r.status_code}: {r.text[:200]}")
-        return
-    if brevo_key:
-        r = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": brevo_key, "Content-Type": "application/json", "accept": "application/json"},
-            json={
-                "sender": {"name": sender_name, "email": sender_email},
-                "to": [{"email": to_email}],
-                "subject": subject,
-                "textContent": body,
-                "replyTo": {"email": reply_to, "name": sender_name},
-            },
-            timeout=30,
-        )
-        if r.status_code >= 300:
-            raise RuntimeError(f"Brevo {r.status_code}: {r.text[:200]}")
-        return
-    raise RuntimeError("Aucun service d'e-mail configuré (RESEND_API_KEY ou BREVO_API_KEY).")
-
-
-def envoyer_notes(rows: list[dict], matiere: str, eval_type: str, sender_name: str, on_progress=None):
-    valid = [r for r in rows if r["Vérification"] == "OK" and r.get("student_id") and r.get("E-mail trouvé")]
-    sent, failures = 0, []
-    for i, row in enumerate(valid, 1):
-        body = build_message(row["Prénom"], matiere, eval_type, row["Note"], sender_name)
-        subject = f"Note {matiere} ({eval_type})"
-        try:
-            send_email(row["E-mail trouvé"], subject, body)
-            sent += 1
-        except Exception as exc:
-            failures.append(f"{row['Nom']} {row['Prénom']} : {exc}")
-        if on_progress:
-            on_progress(i, len(valid))
-    return sent, failures
+    return rows
 
 
 # =========================
@@ -386,253 +384,427 @@ def envoyer_notes(rows: list[dict], matiere: str, eval_type: str, sender_name: s
 # =========================
 
 def fetch_history(user_id: str):
-    res = ensure_auth().table("send_history").select("*").eq("user_id", user_id).order("sent_at", desc=True).limit(200).execute()
-    return res.data or []
+    return api_get("send_history", {"user_id": user_id}, order="sent_at.desc", limit=200)
 
 
 def sent_today(user_id: str) -> int:
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    res = ensure_auth().table("send_history").select("sent_count").eq("user_id", user_id).gte("sent_at", start).execute()
-    return sum(int(r.get("sent_count", 0)) for r in (res.data or []))
+    rows = sb_call(
+        "GET", "/rest/v1/send_history",
+        params={"select": "sent_count", "user_id": f"eq.{user_id}", "sent_at": f"gte.{start}"},
+    ) or []
+    return sum(int(row.get("sent_count", 0)) for row in rows)
 
 
 def already_sent(history: list[dict], class_id: str, matiere: str, eval_type: str) -> bool:
     return any(
-        str(h.get("class_id")) == str(class_id)
-        and clean(h.get("matiere")) == clean(matiere)
-        and clean(h.get("eval_type")) == clean(eval_type)
-        for h in history
+        str(row.get("class_id")) == str(class_id)
+        and clean(row.get("matiere")) == clean(matiere)
+        and clean(row.get("eval_type")) == clean(eval_type)
+        for row in history
     )
 
 
 # =========================
-# Pages
+# E-mails
 # =========================
 
-def page_classes(user):
-    st.subheader("Étape 1 — Créer / gérer sa classe")
-    classes = fetch_classes(user.id)
-    with st.expander("Créer une nouvelle classe", expanded=not classes):
-        name = st.text_input("Nom de la classe", placeholder="MSMD1", key="new_class_name")
-        upload = st.file_uploader("Liste de classe (Excel/CSV : Nom, Prénom, Email)", type=["xlsx", "xls", "csv"], key="new_class_file")
-        if st.button("Créer la classe", type="primary", disabled=not (name.strip() and upload)):
-            df = lire_fichier(upload)
-            rows, errors = validate_class_file(df)
-            if errors:
-                for e in errors:
-                    st.error(e)
-            elif not rows:
-                st.error("Aucun étudiant valide trouvé.")
-            else:
-                res = ensure_auth().table("classes").insert({"user_id": user.id, "name": name.strip()}).execute()
-                class_id = res.data[0]["id"]
-                insert_students(user.id, class_id, rows)
-                st.success(f"Classe « {name.strip()} » créée avec {len(rows)} étudiant(s).")
-                st.rerun()
+def build_message(prenom: str, matiere: str, eval_type: str, note: str, sender_name: str) -> str:
+    return (
+        f"Bonjour {prenom}, ta note de {matiere} ({eval_type}) est : {note}/20. "
+        f"Envoyé par {sender_name}."
+    )
 
-    if not classes:
-        st.info("Créez d'abord une classe.")
+
+def send_batch_resend(messages: list[dict]):
+    if not messages:
         return
-
-    class_map = {f"{c['name']} ({c['id'][:8]})": c for c in classes}
-    label = st.selectbox("Classe à gérer", list(class_map.keys()))
-    cls = class_map[label]
-    students = fetch_students(cls["id"])
-    st.write(f"**{len(students)} étudiant(s)** dans « {cls['name']} ».")
-    if students:
-        st.dataframe(pd.DataFrame(students)[["nom", "prenom", "email"]], hide_index=True, use_container_width=True)
-
-    with st.expander("Ajouter un étudiant"):
-        c1, c2, c3 = st.columns(3)
-        nom = c1.text_input("Nom", key="add_nom")
-        prenom = c2.text_input("Prénom", key="add_prenom")
-        email = c3.text_input("Email", key="add_email")
-        if st.button("Ajouter"):
-            if not (nom.strip() and prenom.strip() and email_valide(email.strip())):
-                st.error("Nom, prénom et e-mail valide requis.")
-            else:
-                insert_students(user.id, cls["id"], [{"nom": nom.strip(), "prenom": prenom.strip(), "email": email.strip().lower()}])
-                st.success("Étudiant ajouté.")
-                st.rerun()
-
-    with st.expander("Modifier / supprimer un étudiant"):
-        if students:
-            s_map = {f"{s['nom']} {s['prenom']} <{s['email']}>": s for s in students}
-            s_label = st.selectbox("Étudiant", list(s_map.keys()), key="edit_select")
-            s = s_map[s_label]
-            c1, c2, c3 = st.columns(3)
-            n_nom = c1.text_input("Nom", value=s["nom"], key="edit_nom")
-            n_prenom = c2.text_input("Prénom", value=s["prenom"], key="edit_prenom")
-            n_email = c3.text_input("Email", value=s["email"], key="edit_email")
-            b1, b2 = st.columns(2)
-            if b1.button("Enregistrer la modification"):
-                if not (n_nom.strip() and n_prenom.strip() and email_valide(n_email.strip())):
-                    st.error("Nom, prénom et e-mail valide requis.")
-                else:
-                    ensure_auth().table("students").update({"nom": n_nom.strip(), "prenom": n_prenom.strip(), "email": n_email.strip().lower()}).eq("id", s["id"]).eq("user_id", user.id).execute()
-                    st.success("Étudiant modifié.")
-                    st.rerun()
-            if b2.button("Supprimer cet étudiant"):
-                ensure_auth().table("students").delete().eq("id", s["id"]).eq("user_id", user.id).execute()
-                st.success("Étudiant supprimé.")
-                st.rerun()
-
-    with st.expander("Recharger toute la liste (remplace la liste actuelle)"):
-        upload = st.file_uploader("Nouveau fichier classe", type=["xlsx", "xls", "csv"], key="reload_class_file")
-        if st.button("Remplacer la liste", disabled=not upload):
-            df = lire_fichier(upload)
-            rows, errors = validate_class_file(df)
-            if errors:
-                for e in errors:
-                    st.error(e)
-            else:
-                ensure_auth().table("students").delete().eq("class_id", cls["id"]).eq("user_id", user.id).execute()
-                insert_students(user.id, cls["id"], rows)
-                st.success(f"Liste remplacée : {len(rows)} étudiant(s).")
-                st.rerun()
-
-    with st.expander("Supprimer la classe et toutes ses données"):
-        st.warning("Cette action supprime la classe, ses étudiants et son historique d'envois.")
-        confirm = st.text_input(f"Tapez le nom de la classe ({cls['name']}) pour confirmer", key="del_class_confirm")
-        if st.button("Supprimer définitivement", disabled=confirm != cls["name"]):
-            ensure_auth().table("classes").delete().eq("id", cls["id"]).eq("user_id", user.id).execute()
-            st.success("Classe supprimée.")
-            st.rerun()
-
-
-def page_send(user):
-    st.subheader("Étape 2 — Envoyer des notes")
-    classes = fetch_classes(user.id)
-    if not classes:
-        st.info("Créez d'abord une classe dans l'étape 1.")
-        return
-
-    class_map = {c["name"]: c for c in classes}
-    c1, c2, c3 = st.columns(3)
-    cls_name = c1.selectbox("Classe", list(class_map.keys()))
-    cls = class_map[cls_name]
-    matiere = c2.text_input("Matière", placeholder="Mathématiques")
-    eval_type = c3.selectbox("Type", ["Test", "Partiel"])
-
-    history = fetch_history(user.id)
-    if matiere.strip() and already_sent(history, cls["id"], matiere, eval_type):
-        st.warning(f"⚠️ {cls_name} / {matiere} / {eval_type} a déjà été envoyé.")
-
-    upload = st.file_uploader("Fichier de notes (Nom, Prénom, Note)", type=["xlsx", "xls", "csv"], key="notes_file")
-    if not upload or not matiere.strip():
-        st.info("Choisissez une classe, indiquez la matière et chargez le fichier de notes.")
-        return
-
-    students = fetch_students(cls["id"])
-    if not students:
-        st.error("Cette classe ne contient aucun étudiant.")
-        return
-
-    preview_key = f"{cls['id']}|{matiere}|{eval_type}|{upload.name}|{len(upload.getvalue())}"
-    if st.session_state.get("preview_key") != preview_key:
-        try:
-            st.session_state["preview_df"] = preparer_apercu(lire_fichier(upload), students)
-            st.session_state["preview_key"] = preview_key
-        except Exception as exc:
-            st.error(f"Fichier illisible : {exc}")
-            return
-
-    preview = st.session_state["preview_df"]
-    st.write("**Aperçu** — corrigez les lignes rouges avec la liste déroulante, puis envoyez.")
-    corrected = appliquer_corrections(preview, students)
-
-    def style_row(row):
-        ok = row["Vérification"] == "OK"
-        return ["" if ok else "color:#b00020;font-weight:bold"] * len(row)
-
-    show = corrected[["Nom", "Prénom", "E-mail trouvé", "Note", "Vérification"]]
-    st.dataframe(show.style.apply(style_row, axis=1), hide_index=True, use_container_width=True)
-    valid_rows = corrected[corrected["Vérification"] == "OK"].to_dict("records")
-    st.caption(f"{len(valid_rows)} ligne(s) prête(s) sur {len(corrected)}. Les lignes rouges ne seront pas envoyées.")
-
-    used = sent_today(user.id)
-    remaining = max(DAILY_LIMIT - used, 0)
-    st.caption(f"Limite quotidienne : {used}/{DAILY_LIMIT} e-mails envoyés aujourd'hui ({remaining} restant(s)).")
-    if len(valid_rows) > remaining:
-        st.error("La limite quotidienne serait dépassée. Réduisez le nombre d'envois ou réessayez demain.")
-
-    sender_name = st.text_input("Nom affiché aux étudiants", value=secret("SENDER_NAME", user.email or "Chef de classe"))
-    disabled = not valid_rows or len(valid_rows) > remaining or not sender_name.strip()
-    if st.button("Envoyer", type="primary", disabled=disabled):
-        progress = st.progress(0)
-        sent, failures = envoyer_notes(
-            valid_rows, matiere.strip(), eval_type, sender_name.strip(),
-            on_progress=lambda i, total: progress.progress(i / total if total else 1),
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY non configuré.")
+    sender = f"{SENDER_NAME} <{SENDER_EMAIL}>"
+    for start in range(0, len(messages), 100):
+        chunk = messages[start:start + 100]
+        payload = [
+            {
+                "from": sender,
+                "to": [msg["to"]],
+                "subject": msg["subject"],
+                "text": msg["body"],
+                "reply_to": REPLY_TO,
+            }
+            for msg in chunk
+        ]
+        response = requests.post(
+            "https://api.resend.com/emails/batch",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
         )
+        if response.status_code >= 300:
+            raise RuntimeError(f"Resend {response.status_code} : {response.text[:200]}")
+
+
+def send_one_brevo(msg: dict):
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY non configuré.")
+    response = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json",
+                 "accept": "application/json"},
+        json={
+            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+            "to": [{"email": msg["to"]}],
+            "subject": msg["subject"],
+            "textContent": msg["body"],
+            "replyTo": {"email": REPLY_TO, "name": SENDER_NAME},
+        },
+        timeout=30,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Brevo {response.status_code} : {response.text[:200]}")
+
+
+def envoyer_notes(rows: list[dict], matiere: str, eval_type: str, sender_name: str):
+    messages = [
+        {
+            "to": row["email"],
+            "subject": f"Note {matiere} ({eval_type})",
+            "body": build_message(row["prenom"], matiere, eval_type, row["note"], sender_name),
+        }
+        for row in rows
+        if email_valide(row.get("email", "")) and row.get("prenom")
+    ]
+    if not messages:
+        return 0, []
+
+    if RESEND_API_KEY:
+        try:
+            send_batch_resend(messages)
+            return len(messages), []
+        except Exception as exc:
+            return 0, [f"Envoi groupé Resend : {exc}"]
+
+    if BREVO_API_KEY:
+        sent, failures = 0, []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(send_one_brevo, msg): msg for msg in messages}
+            for future in as_completed(futures):
+                msg = futures[future]
+                try:
+                    future.result()
+                    sent += 1
+                except Exception as exc:
+                    failures.append(f"{msg['to']} : {exc}")
+        return sent, failures
+
+    return 0, ["Aucun service d'e-mail configuré (RESEND_API_KEY ou BREVO_API_KEY)."]
+
+
+# =========================
+# Routes
+# =========================
+
+@app.route("/")
+def home():
+    if current_user():
+        return redirect(url_for("classes_page"))
+    return render_template("auth.html")
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    email = request.form.get("email", "").strip()
+    password = request.form.get("password", "")
+    try:
+        data = auth_signin(email, password)
+        session["access_token"] = data["access_token"]
+        session["refresh_token"] = data.get("refresh_token", "")
+        session["user"] = data.get("user", {})
+        flash("Connexion réussie.", "success")
+        return redirect(url_for("classes_page"))
+    except Exception as exc:
+        flash(f"Connexion impossible : {exc}", "error")
+        return redirect(url_for("home"))
+
+
+@app.route("/signup", methods=["POST"])
+def signup():
+    name = request.form.get("name", "").strip()
+    email = request.form.get("email", "").strip()
+    password = request.form.get("password", "")
+    if not name or not email_valide(email) or len(password) < 8:
+        flash("Nom, e-mail valide et mot de passe de 8 caractères minimum requis.", "error")
+        return redirect(url_for("home"))
+    try:
+        auth_signup(email, password, name)
+        flash("Compte créé. Confirme ton e-mail puis connecte-toi.", "success")
+    except Exception as exc:
+        flash(f"Inscription impossible : {exc}", "error")
+    return redirect(url_for("home"))
+
+
+@app.route("/reset", methods=["POST"])
+def reset_password():
+    email = request.form.get("email", "").strip()
+    if not email_valide(email):
+        flash("Indique une adresse e-mail valide.", "error")
+        return redirect(url_for("home"))
+    try:
+        auth_recover(email, public_url())
+        flash("Si un compte existe, un lien de réinitialisation a été envoyé.", "success")
+    except Exception as exc:
+        flash(f"Demande impossible : {exc}", "error")
+    return redirect(url_for("home"))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    clear_session()
+    flash("Tu es déconnecté.", "success")
+    return redirect(url_for("home"))
+
+
+@app.route("/classes")
+@login_required
+def classes_page():
+    user = current_user()
+    classes = fetch_classes(user["id"])
+    class_id = request.args.get("class") or (classes[0]["id"] if classes else None)
+    students = fetch_students(class_id, user["id"]) if class_id else []
+    edit_id = request.args.get("edit")
+    editing = next((s for s in students if s["id"] == edit_id), None)
+    return render_template(
+        "classes.html", classes=classes, selected_class=class_id,
+        students=students, editing=editing,
+    )
+
+
+@app.route("/classes/create", methods=["POST"])
+@login_required
+def class_create():
+    user = current_user()
+    name = request.form.get("name", "").strip()
+    upload = request.files.get("file")
+    if not name or not upload or not upload.filename:
+        flash("Nom et fichier de classe requis.", "error")
+        return redirect(url_for("classes_page"))
+    try:
+        df = lire_fichier(upload.read(), upload.filename)
+        rows, errors = validate_class_file(df)
+        if errors:
+            for error in errors[:10]:
+                flash(error, "error")
+        elif not rows:
+            flash("Aucun étudiant valide trouvé.", "error")
+        else:
+            created = api_insert("classes", {"user_id": user["id"], "name": name})
+            class_id = created[0]["id"]
+            insert_students(user["id"], class_id, rows)
+            flash(f"Classe « {name} » créée avec {len(rows)} étudiant(s).", "success")
+            return redirect(url_for("classes_page", **{"class": class_id}))
+    except Exception as exc:
+        flash(f"Fichier illisible : {exc}", "error")
+    return redirect(url_for("classes_page"))
+
+
+@app.route("/classes/<class_id>/students/add", methods=["POST"])
+@login_required
+def student_add(class_id: str):
+    user = current_user()
+    nom = request.form.get("nom", "").strip()
+    prenom = request.form.get("prenom", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    if not (nom and prenom and email_valide(email)):
+        flash("Nom, prénom et e-mail valide requis.", "error")
+    else:
+        insert_students(user["id"], class_id, [{"nom": nom, "prenom": prenom, "email": email}])
+        flash("Étudiant ajouté.", "success")
+    return redirect(url_for("classes_page", **{"class": class_id}))
+
+
+@app.route("/students/<student_id>/update", methods=["POST"])
+@login_required
+def student_update(student_id: str):
+    user = current_user()
+    class_id = request.form.get("class_id", "")
+    nom = request.form.get("nom", "").strip()
+    prenom = request.form.get("prenom", "").strip()
+    email = request.form.get("email", "").strip().lower()
+    if not (nom and prenom and email_valide(email)):
+        flash("Nom, prénom et e-mail valide requis.", "error")
+    else:
+        api_update("students", {"id": student_id, "user_id": user["id"]},
+                   {"nom": nom, "prenom": prenom, "email": email})
+        flash("Étudiant modifié.", "success")
+    return redirect(url_for("classes_page", **{"class": class_id}))
+
+
+@app.route("/students/<student_id>/delete", methods=["POST"])
+@login_required
+def student_delete(student_id: str):
+    user = current_user()
+    class_id = request.form.get("class_id", "")
+    api_delete("students", {"id": student_id, "user_id": user["id"]})
+    flash("Étudiant supprimé.", "success")
+    return redirect(url_for("classes_page", **{"class": class_id}))
+
+
+@app.route("/classes/<class_id>/students/reload", methods=["POST"])
+@login_required
+def students_reload(class_id: str):
+    user = current_user()
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        flash("Fichier requis.", "error")
+        return redirect(url_for("classes_page", **{"class": class_id}))
+    try:
+        df = lire_fichier(upload.read(), upload.filename)
+        rows, errors = validate_class_file(df)
+        if errors:
+            for error in errors[:10]:
+                flash(error, "error")
+        else:
+            api_delete("students", {"class_id": class_id, "user_id": user["id"]})
+            insert_students(user["id"], class_id, rows)
+            flash(f"Liste remplacée : {len(rows)} étudiant(s).", "success")
+    except Exception as exc:
+        flash(f"Fichier illisible : {exc}", "error")
+    return redirect(url_for("classes_page", **{"class": class_id}))
+
+
+@app.route("/classes/<class_id>/delete", methods=["POST"])
+@login_required
+def class_delete(class_id: str):
+    user = current_user()
+    classes = fetch_classes(user["id"])
+    target = next((c for c in classes if c["id"] == class_id), None)
+    if not target:
+        abort(404)
+    if request.form.get("confirmation", "").strip() != target["name"]:
+        flash("Le nom de la classe ne correspond pas.", "error")
+        return redirect(url_for("classes_page", **{"class": class_id}))
+    api_delete("classes", {"id": class_id, "user_id": user["id"]})
+    flash("Classe et données associées supprimées.", "success")
+    return redirect(url_for("classes_page"))
+
+
+@app.route("/send", methods=["GET", "POST"])
+@login_required
+def send_page():
+    user = current_user()
+    classes = fetch_classes(user["id"])
+    if not classes:
+        flash("Crée d'abord une classe.", "error")
+        return redirect(url_for("classes_page"))
+
+    if request.method == "POST":
+        class_id = request.form.get("class_id", "")
+        matiere = request.form.get("matiere", "").strip()
+        eval_type = request.form.get("eval_type", "Test")
+        upload = request.files.get("file")
+        selected = next((c for c in classes if c["id"] == class_id), None)
+        if not selected or not matiere or not upload or not upload.filename:
+            flash("Classe, matière et fichier requis.", "error")
+            return redirect(url_for("send_page"))
+        try:
+            students = fetch_students(class_id, user["id"])
+            df = lire_fichier(upload.read(), upload.filename)
+            rows = preparer_apercu(df, students)
+        except Exception as exc:
+            flash(f"Fichier illisible : {exc}", "error")
+            return redirect(url_for("send_page"))
+        if not rows:
+            flash("Aucune ligne trouvée dans le fichier.", "error")
+            return redirect(url_for("send_page"))
+        history = fetch_history(user["id"])
+        warning = already_sent(history, class_id, matiere, eval_type)
+        used = sent_today(user["id"])
+        return render_template(
+            "send_preview.html", classes=classes, selected=selected,
+            matiere=matiere, eval_type=eval_type, rows=rows,
+            rows_json=json.dumps(rows, ensure_ascii=False),
+            options=[{"id": s["id"], "label": f"{s['nom']} {s['prenom']} <{s['email']}>"}
+                     for s in students],
+            used=used, remaining=max(DAILY_LIMIT - used, 0), warning=warning,
+        )
+
+    return render_template("send.html", classes=classes)
+
+
+@app.route("/send/confirm", methods=["POST"])
+@login_required
+def send_confirm():
+    user = current_user()
+    try:
+        rows = json.loads(request.form.get("rows", "[]"))
+    except (ValueError, TypeError):
+        rows = []
+    class_id = request.form.get("class_id", "")
+    matiere = request.form.get("matiere", "").strip()
+    eval_type = request.form.get("eval_type", "Test")
+    sender_name = request.form.get("sender_name", "").strip() or SENDER_NAME
+
+    classes = fetch_classes(user["id"])
+    target = next((c for c in classes if c["id"] == class_id), None)
+    if not target or not matiere:
+        abort(400)
+
+    students = {s["id"]: s for s in fetch_students(class_id, user["id"])}
+    valid = []
+    for row in rows:
+        override_id = request.form.get(f"student_{row.get('row_id')}", "")
+        if override_id in students:
+            row["student_id"] = override_id
+        student = students.get(row.get("student_id"))
+        note, note_ok = parse_note(row.get("Note"))
+        if not student or not note_ok:
+            continue
+        valid.append({
+            "email": student["email"],
+            "prenom": student["prenom"],
+            "note": fmt_note(note),
+        })
+
+    history = fetch_history(user["id"])
+    warning = already_sent(history, class_id, matiere, eval_type)
+    used = sent_today(user["id"])
+    remaining = max(DAILY_LIMIT - used, 0)
+
+    if not valid:
+        flash("Aucune ligne valide à envoyer.", "error")
+    elif len(valid) > remaining:
+        flash("Limite quotidienne dépassée. Réduis le nombre d'envois.", "error")
+    else:
+        sent, failures = envoyer_notes(valid, matiere, eval_type, sender_name)
         if sent:
-            ensure_auth().table("send_history").insert({
-                "user_id": user.id,
-                "class_id": cls["id"],
-                "class_name": cls_name,
-                "matiere": matiere.strip(),
+            api_insert("send_history", {
+                "user_id": user["id"],
+                "class_id": class_id,
+                "class_name": target["name"],
+                "matiere": matiere,
                 "eval_type": eval_type,
                 "sent_count": sent,
-            }).execute()
-        st.success(f"Récapitulatif : {sent} envoyé(s), {len(failures)} échec(s).")
-        for f in failures:
-            st.error(f)
-        st.session_state.pop("preview_df", None)
-        st.session_state.pop("preview_key", None)
+            })
+        return render_template("send_result.html", sent=sent, failures=failures,
+                               class_name=target["name"], matiere=matiere,
+                               eval_type=eval_type, warning=warning)
+
+    return redirect(url_for("send_page"))
 
 
-def page_history(user):
-    st.subheader("Historique des envois")
-    history = fetch_history(user.id)
-    if not history:
-        st.info("Aucun envoi pour le moment.")
-        return
-    df = pd.DataFrame(history)[["sent_at", "class_name", "matiere", "eval_type", "sent_count"]]
-    df.columns = ["Date", "Classe", "Matière", "Type", "Envoyés"]
-    st.dataframe(df, hide_index=True, use_container_width=True)
-    st.caption("Les notes ne sont pas conservées après l'envoi.")
-
-
-def page_privacy():
-    st.subheader("Politique de confidentialité")
-    st.markdown(
-        """
-**Responsable.** Le chef de classe qui utilise l'application est responsable des données qu'il importe.  
-**Données stockées.** Compte (e-mail, nom), classes, listes d'étudiants (nom, prénom, e-mail) et historique des envois (classe, matière, type, date, nombre d'e-mails envoyés).  
-**Notes.** Les notes ne sont **pas conservées** après l'envoi. Elles sont utilisées uniquement pour composer l'e-mail.  
-**Accès.** Chaque chef de classe ne voit que ses propres données (contrôle d'accès Supabase RLS).  
-**Sous-traitants.** Supabase (authentification/base de données) et le service d'e-mail configuré (Brevo ou Resend) traitent les données nécessaires à leur fonction.  
-**Suppression.** Vous pouvez supprimer une classe et toutes ses données depuis l'étape 1. Pour supprimer votre compte, contactez l'administrateur de l'instance.  
-**Contact.** Pour toute question, contactez l'administrateur de l'application.
-        """.strip()
-    )
-
-
-# =========================
-# Main
-# =========================
-
-def main():
-    st.set_page_config(page_title="Notes de classe", page_icon="✉️", layout="wide")
+@app.route("/history")
+@login_required
+def history_page():
     user = current_user()
-    if not user:
-        page_auth()
-        return
+    history = fetch_history(user["id"])
+    return render_template("history.html", history=history)
 
-    with st.sidebar:
-        st.write(f"Connecté : **{user.email}**")
-        page = st.radio("Navigation", ["Envoyer des notes", "Mes classes", "Historique", "Confidentialité"])
-        if st.button("Se déconnecter"):
-            logout()
 
-    if page == "Mes classes":
-        page_classes(user)
-    elif page == "Envoyer des notes":
-        page_send(user)
-    elif page == "Historique":
-        page_history(user)
-    else:
-        page_privacy()
+@app.route("/privacy")
+def privacy_page():
+    return render_template("privacy.html")
 
 
 if __name__ == "__main__":
-    main()
+    app.run(debug=True)

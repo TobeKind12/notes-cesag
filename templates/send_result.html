@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Résultat de l'envoi — Notes de classe{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-body">
+    <h2 class="h4">Récapitulatif</h2>
+    {% if warning %}<div class="alert alert-warning">⚠️ Cet envoi avait déjà été effectué pour cette classe.</div>{% endif %}
+    <p><strong>{{ sent }}</strong> e-mail(s) envoyé(s) pour <strong>{{ class_name }}</strong> — {{ matiere }} ({{ eval_type }}).</p>
+    {% if failures %}
+      <div class="alert alert-danger">
+        <strong>{{ failures|length }}</strong> échec(s) :
+        <ul class="mb-0">
+          {% for failure in failures %}<li>{{ failure }}</li>{% endfor %}
+        </ul>
+      </div>
+    {% elif sent %}
+      <div class="alert alert-success">Tous les e-mails ont été envoyés.</div>
+    {% endif %}
+    <a class="btn btn-primary" href="{{ url_for('send_page') }}">Nouvel envoi</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('history_page') }}">Voir l'historique</a>
+  </div>
+</div>
+{% endblock %}

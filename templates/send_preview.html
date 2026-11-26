@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Aperçu des notes — Notes de classe{% endblock %}
+{% block content %}
+<h2 class="h4 mb-3">Aperçu — corrigez les lignes rouges avant envoi</h2>
+{% if warning %}<div class="alert alert-warning">⚠️ Cette classe / matière / type a déjà été envoyé.</div>{% endif %}
+
+<form method="post" action="{{ url_for('send_confirm') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="class_id" value="{{ selected.id }}">
+  <input type="hidden" name="matiere" value="{{ matiere }}">
+  <input type="hidden" name="eval_type" value="{{ eval_type }}">
+  <textarea name="rows" hidden>{{ rows_json | tojson }}</textarea>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-striped align-middle">
+      <thead><tr><th>Nom</th><th>Prénom</th><th>E-mail trouvé</th><th>Note</th><th>Vérification</th><th>Correction</th></tr></thead>
+      <tbody>
+        {% for row in rows %}
+        <tr class="{{ 'table-danger' if row['Vérification'] != 'OK' else '' }}">
+          <td>{{ row['Nom'] }}</td>
+          <td>{{ row['Prénom'] }}</td>
+          <td>{{ row['E-mail trouvé'] }}</td>
+          <td>{{ row['Note'] }}</td>
+          <td>{{ row['Vérification'] }}</td>
+          <td>
+            {% if row['Vérification'] != 'OK' %}
+            <select name="student_{{ row.row_id }}" class="form-select form-select-sm">
+              <option value="">— choisir un étudiant —</option>
+              {% for o in options %}<option value="{{ o.id }}">{{ o.label }}</option>{% endfor %}
+            </select>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="alert alert-info">
+    Limite quotidienne : {{ used }}/{{ DAILY_LIMIT if DAILY_LIMIT is defined else 200 }} e-mails envoyés aujourd'hui
+    ({{ remaining }} restant(s)). Les lignes rouges non corrigées ne seront pas envoyées.
+  </div>
+
+  <div class="mb-3">
+    <label class="form-label">Nom affiché aux étudiants</label>
+    <input name="sender_name" class="form-control" value="{{ SENDER_NAME if SENDER_NAME is defined else 'Notes de classe' }}" required>
+  </div>
+
+  <button class="btn btn-primary" type="submit">Envoyer</button>
+  <a class="btn btn-outline-secondary" href="{{ url_for('send_page') }}">Annuler</a>
+</form>
+{% endblock %}

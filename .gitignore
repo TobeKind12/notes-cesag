@@ -1,5 +1,8 @@
 .streamlit/secrets.toml
+.env
+.vercel/
 __pycache__/
 *.pyc
 .venv/
 historique_envois.csv
+*.log

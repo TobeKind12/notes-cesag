@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Envoyer des notes — Notes de classe{% endblock %}
+{% block content %}
+<h2 class="h4 mb-3">Étape 2 — Envoyer des notes</h2>
+<div class="card">
+  <div class="card-body">
+    <form method="post" action="{{ url_for('send_page') }}" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="row g-3">
+        <div class="col-md-4">
+          <label class="form-label">Classe</label>
+          <select name="class_id" class="form-select" required>
+            {% for c in classes %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Matière</label>
+          <input name="matiere" class="form-control" placeholder="Mathématiques" required>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Type</label>
+          <select name="eval_type" class="form-select">
+            <option>Test</option><option>Partiel</option>
+          </select>
+        </div>
+        <div class="col-12">
+          <label class="form-label">Fichier de notes (Nom, Prénom, Note)</label>
+          <input type="file" name="file" class="form-control" accept=".xlsx,.xls,.csv" required>
+        </div>
+      </div>
+      <button class="btn btn-primary mt-3" type="submit">Vérifier l'aperçu</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
