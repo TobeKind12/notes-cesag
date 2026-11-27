@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 historique_envois.csv
 *.log
+.vercel
+.env*
