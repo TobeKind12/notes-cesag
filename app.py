@@ -38,7 +38,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or pysecrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
-DAILY_LIMIT = 200
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "100"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")

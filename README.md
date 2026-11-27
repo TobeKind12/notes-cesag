@@ -55,6 +55,8 @@ REPLY_TO=notes@votre-domaine.fr
 
 `SECRET_KEY` est obligatoire en production (signature des sessions). Pour Brevo, remplacer `RESEND_API_KEY` par `BREVO_API_KEY`.
 
+`DAILY_LIMIT` (optionnel, défaut `100`) : nombre max d'e-mails par jour et par compte. Le défaut correspond au quota du plan gratuit Resend (100/jour, 3 000/mois). Si tu passes à un plan payant, ajoute `DAILY_LIMIT=200` (ou plus) dans Vercel.
+
 ## 4. Déploiement Vercel
 
 1. Le dépôt GitHub est connecté à Vercel : <https://github.com/TobeKind12/notes-cesag>
