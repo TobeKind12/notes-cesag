@@ -106,6 +106,28 @@ def email_valide(email: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email or ""))
 
 
+def parse_rows_form(raw: str | None) -> list[dict]:
+    """Charge les lignes de l'aperçu.
+
+    Gère aussi les anciens formulaires où la liste avait été sérialisée deux fois
+    (une chaîne JSON contenant elle-même du JSON). Les éléments non-dict sont ignorés.
+    """
+    try:
+        data = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [row for row in data if isinstance(row, dict)]
+
+
 def parse_note(value):
     s = txt(value).replace(",", ".")
     if not s:
@@ -418,33 +440,60 @@ def build_message(prenom: str, matiere: str, eval_type: str, note: str, sender_n
     )
 
 
+def api_error_message(service: str, response) -> str:
+    """Extrait le motif d'un refus d'API pour l'afficher à l'utilisateur."""
+    detail = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            detail = str(payload.get("message") or payload.get("error") or "")
+    except ValueError:
+        pass
+    detail = detail or (response.text or "").strip()[:200] or "réponse vide"
+    return f"{service} {response.status_code} : {detail}"
+
+
+def resend_payload(msg: dict) -> dict:
+    return {
+        "from": f"{SENDER_NAME} <{SENDER_EMAIL}>",
+        "to": [msg["to"]],
+        "subject": msg["subject"],
+        "text": msg["body"],
+        "reply_to": REPLY_TO,
+    }
+
+
+def send_one_resend(msg: dict):
+    """Envoi unitaire, utilisé pour isoler les refus individuels de Resend."""
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY non configuré.")
+    response = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=resend_payload(msg),
+        timeout=30,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(api_error_message("Resend", response))
+
+
 def send_batch_resend(messages: list[dict]):
     if not messages:
         return
     if not RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY non configuré.")
-    sender = f"{SENDER_NAME} <{SENDER_EMAIL}>"
     for start in range(0, len(messages), 100):
         chunk = messages[start:start + 100]
-        payload = [
-            {
-                "from": sender,
-                "to": [msg["to"]],
-                "subject": msg["subject"],
-                "text": msg["body"],
-                "reply_to": REPLY_TO,
-            }
-            for msg in chunk
-        ]
         response = requests.post(
             "https://api.resend.com/emails/batch",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}",
                      "Content-Type": "application/json"},
-            json=payload,
+            json=[resend_payload(msg) for msg in chunk],
             timeout=30,
         )
         if response.status_code >= 300:
-            raise RuntimeError(f"Resend {response.status_code} : {response.text[:200]}")
+            raise RuntimeError(api_error_message("Resend", response))
 
 
 def send_one_brevo(msg: dict):
@@ -464,7 +513,7 @@ def send_one_brevo(msg: dict):
         timeout=30,
     )
     if response.status_code >= 300:
-        raise RuntimeError(f"Brevo {response.status_code} : {response.text[:200]}")
+        raise RuntimeError(api_error_message("Brevo", response))
 
 
 def envoyer_notes(rows: list[dict], matiere: str, eval_type: str, sender_name: str):
@@ -484,8 +533,18 @@ def envoyer_notes(rows: list[dict], matiere: str, eval_type: str, sender_name: s
         try:
             send_batch_resend(messages)
             return len(messages), []
-        except Exception as exc:
-            return 0, [f"Envoi groupé Resend : {exc}"]
+        except Exception:
+            # Un lot entier peut être refusé à cause d'un seul destinataire
+            # (ex. onboarding@resend.dev). On isole alors chaque e-mail pour
+            # afficher « Échec : raison » et continuer avec les autres.
+            sent, failures = 0, []
+            for msg in messages:
+                try:
+                    send_one_resend(msg)
+                    sent += 1
+                except Exception as one_exc:
+                    failures.append(f"{msg['to']} : Échec : {one_exc}")
+            return sent, failures
 
     if BREVO_API_KEY:
         sent, failures = 0, []
@@ -725,7 +784,8 @@ def send_page():
         return render_template(
             "send_preview.html", classes=classes, selected=selected,
             matiere=matiere, eval_type=eval_type, rows=rows,
-            rows_json=json.dumps(rows, ensure_ascii=False),
+            # Jinja applique | tojson : on passe la liste, pas une chaîne déjà encodée.
+            rows_json=rows,
             options=[{"id": s["id"], "label": f"{s['nom']} {s['prenom']} <{s['email']}>"}
                      for s in students],
             used=used, remaining=max(DAILY_LIMIT - used, 0), warning=warning,
@@ -738,10 +798,7 @@ def send_page():
 @login_required
 def send_confirm():
     user = current_user()
-    try:
-        rows = json.loads(request.form.get("rows", "[]"))
-    except (ValueError, TypeError):
-        rows = []
+    rows = parse_rows_form(request.form.get("rows"))
     class_id = request.form.get("class_id", "")
     matiere = request.form.get("matiere", "").strip()
     eval_type = request.form.get("eval_type", "Test")
@@ -755,7 +812,8 @@ def send_confirm():
     students = {s["id"]: s for s in fetch_students(class_id, user["id"])}
     valid = []
     for row in rows:
-        override_id = request.form.get(f"student_{row.get('row_id')}", "")
+        row_id = row.get("row_id", "")
+        override_id = request.form.get(f"student_{row_id}", "")
         if override_id in students:
             row["student_id"] = override_id
         student = students.get(row.get("student_id"))
@@ -778,7 +836,10 @@ def send_confirm():
     elif len(valid) > remaining:
         flash("Limite quotidienne dépassée. Réduis le nombre d'envois.", "error")
     else:
-        sent, failures = envoyer_notes(valid, matiere, eval_type, sender_name)
+        try:
+            sent, failures = envoyer_notes(valid, matiere, eval_type, sender_name)
+        except Exception as exc:
+            sent, failures = 0, [f"Échec : {exc}"]
         if sent:
             api_insert("send_history", {
                 "user_id": user["id"],

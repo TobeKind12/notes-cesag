@@ -79,6 +79,13 @@ flask --app app run
 
 Ouvrir <http://localhost:5000>.
 
+Test automatisé du flux aperçu → confirmation (fichiers `tests/classe_test.xlsx` et
+`tests/notes_test.xlsx`, aucun e-mail ni appel Supabase réel) :
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 6. Mode d'emploi
 
 1. Créer un compte, confirmer l'e-mail, se connecter.
