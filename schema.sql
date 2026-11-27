@@ -1,4 +1,4 @@
--- Schéma Supabase pour "Notes de classe"
+-- Schéma Supabase pour "Notes-Cesag"
 -- À exécuter dans Supabase > SQL Editor (en une fois).
 
 create extension if not exists pgcrypto;

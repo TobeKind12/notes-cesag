@@ -1,4 +1,4 @@
-"""Notes de classe — application Flask serverless pour Vercel.
+"""Notes-Cesag — application Flask serverless pour Vercel.
 
 Authentification et données : Supabase (REST + RLS).
 Envoi d'e-mails : Resend (batch) ou Brevo.
@@ -38,6 +38,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY") or os.getenv("FLASK_SECRET_KEY") or pysecrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
 
+APP_NAME = "Notes-Cesag"
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "100"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -47,7 +48,7 @@ SITE_URL = os.getenv("SITE_URL", "").rstrip("/")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
-SENDER_NAME = os.getenv("SENDER_NAME", "Notes de classe")
+SENDER_NAME = os.getenv("SENDER_NAME", APP_NAME)
 REPLY_TO = os.getenv("REPLY_TO", SENDER_EMAIL)
 
 
@@ -80,6 +81,7 @@ def inject_globals():
         "current_user": current_user(),
         "DAILY_LIMIT": DAILY_LIMIT,
         "SENDER_NAME": SENDER_NAME,
+        "APP_NAME": APP_NAME,
     }
 
 

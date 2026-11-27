@@ -1,4 +1,4 @@
-# Notes de classe — Flask + Supabase + Vercel
+# Notes-Cesag — Flask + Supabase + Vercel
 
 Application web pour chefs de classe : créer une classe, importer une liste d'étudiants, charger des notes et envoyer **un e-mail séparé par étudiant**. Comptes Supabase Auth, données isolées par RLS, envoi via Resend (batch) ou Brevo.
 
@@ -49,7 +49,7 @@ SITE_URL=https://TON-PROJECT.vercel.app
 SECRET_KEY=<chaîne aléatoire longue>
 RESEND_API_KEY=re_xxxxx
 SENDER_EMAIL=notes@votre-domaine.fr
-SENDER_NAME=Notes de classe
+SENDER_NAME=Notes-Cesag
 REPLY_TO=notes@votre-domaine.fr
 ```
 

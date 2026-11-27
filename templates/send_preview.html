@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Aperçu des notes — Notes de classe{% endblock %}
+{% block title %}Aperçu des notes — {{ APP_NAME }}{% endblock %}
 {% block content %}
 <h2 class="h4 mb-3">Aperçu — corrigez les lignes rouges avant envoi</h2>
 {% if warning %}<div class="alert alert-warning">⚠️ Cette classe / matière / type a déjà été envoyé.</div>{% endif %}
@@ -43,7 +43,7 @@
 
   <div class="mb-3">
     <label class="form-label">Nom affiché aux étudiants</label>
-    <input name="sender_name" class="form-control" value="{{ SENDER_NAME if SENDER_NAME is defined else 'Notes de classe' }}" required>
+    <input name="sender_name" class="form-control" value="{{ SENDER_NAME }}" required>
   </div>
 
   <button class="btn btn-primary" type="submit">Envoyer</button>
